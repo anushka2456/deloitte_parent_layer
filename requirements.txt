@@ -4,4 +4,6 @@ pandas
 numpy
 scikit-learn
 joblib
-google-generativeai
+google-genai
+requests
+
