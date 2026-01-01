@@ -20,8 +20,17 @@ except Exception:
 BASE_DIR = Path(__file__).parent
 
 DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
-MODEL_PATH = BASE_DIR / "models" / "parent_layer" / "parent_model_rf.joblib"
-PREPROCESSOR_PATH = BASE_DIR / "models" / "preprocessors" / "parent_preprocessor_coltransformer.joblib"
+
+MODEL_DIR = BASE_DIR / "models" / "parent_layer"
+PREPROCESSOR_DIR = BASE_DIR / "models" / "preprocessors"
+
+MODEL_PATH = MODEL_DIR / "parent_model_rf.joblib"
+PREPROCESSOR_PATH = PREPROCESSOR_DIR / "parent_preprocessor_coltransformer.joblib"
+
+
+# ---------- ENSURE DIRECTORIES EXIST ----------
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+PREPROCESSOR_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------- ENSURE MODEL EXISTS (RENDER-SAFE) ----------
@@ -30,19 +39,20 @@ def ensure_model_exists():
         print("Model or preprocessor missing. Training on startup...")
 
         subprocess.run(
-            ["python", "models/preprocessors/build_preprocessor.py"],
+            ["python", "train_and_predict_rf.py"],
             check=True
         )
 
-        subprocess.run(
-            ["python", "train_parent_layer.py"],
-            check=True
-        )
+        if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
+            raise RuntimeError(
+                "Training script finished but model/preprocessor files were not created."
+            )
 
-        print("Training completed.")
+        print("Training completed and artifacts found.")
 
 
 ensure_model_exists()
+
 
 # ---------- LOAD ARTIFACTS ----------
 model = joblib.load(MODEL_PATH)
@@ -99,7 +109,6 @@ def location_match(parent_pref: str, career_loc: str) -> int:
 
 
 def explain_with_gemini(career_id: str, score: float) -> str:
-    # HARD FAIL-SAFE: explanation must NEVER crash API
     if not GEMINI_AVAILABLE:
         return (
             "This career aligns well with parental priorities such as financial stability, "
