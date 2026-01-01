@@ -6,9 +6,13 @@ import pandas as pd
 import joblib
 import os
 
-# ---------- Gemini (stable SDK) ----------
-import google.generativeai as genai
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# ---------- OPTIONAL Gemini (safe import) ----------
+try:
+    import google.generativeai as genai
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
 
 # ---------- Paths ----------
 BASE_DIR = Path(__file__).parent
@@ -17,7 +21,7 @@ DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
 MODEL_PATH = BASE_DIR / "models" / "parent_layer" / "parent_model_rf.joblib"
 PREPROCESSOR_PATH = BASE_DIR / "models" / "preprocessors" / "parent_preprocessor_coltransformer.joblib"
 
-# ---------- Load artifacts (OLD BEHAVIOR) ----------
+# ---------- Load artifacts ----------
 model = joblib.load(MODEL_PATH)
 preprocessor = joblib.load(PREPROCESSOR_PATH)
 
@@ -68,6 +72,12 @@ def location_match(parent_pref: str, career_loc: str) -> int:
 
 
 def explain_with_gemini(career_id: str, score: float) -> str:
+    if not GEMINI_AVAILABLE:
+        return (
+            "This career aligns well with parental priorities such as financial stability, "
+            "job security, and long-term growth prospects."
+        )
+
     prompt = f"""
 Explain to a parent why the career '{career_id}' received a high recommendation score of {round(score, 2)}.
 
@@ -79,9 +89,19 @@ Focus on:
 
 Use simple language. Avoid technical terms.
 """
-    llm = genai.GenerativeModel("gemini-2.5-pro")
-    response = llm.generate_content(prompt)
-    return response.text.strip()
+
+    try:
+        llm = genai.GenerativeModel("gemini-2.5-pro")
+        response = llm.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        # CRITICAL: never crash the API because of Gemini
+        print("Gemini error:", e)
+        return (
+            "This career matches parental expectations based on stability, affordability, "
+            "and long-term prospects."
+        )
+
 
 # ---------- Endpoint ----------
 @app.post("/rescore-parent")
@@ -134,13 +154,7 @@ def rescore_parent(input: ParentInput):
     top_5 = results[:5]
     best = top_5[0]
 
-    try:
-        explanation = explain_with_gemini(best["career_id"], best["parent_score"])
-    except Exception:
-        explanation = (
-            "This career aligns strongly with parental priorities such as financial stability, "
-            "job security, and long-term prospects."
-        )
+    explanation = explain_with_gemini(best["career_id"], best["parent_score"])
 
     return {
         "top_5_parent_scores": top_5,
