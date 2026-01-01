@@ -1,225 +1,90 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-from typing import List
-from pathlib import Path
-import pandas as pd
-import joblib
 import os
-import subprocess
+import json
+import joblib
+import requests
+from fastapi import FastAPI, HTTPException
 
-# ==============================
-# OPTIONAL GEMINI (FAIL-SAFE)
-# ==============================
-GEMINI_AVAILABLE = False
-try:
-    # google-generativeai is deprecated but still works;
-    # we make it OPTIONAL and NON-BLOCKING
-    import google.generativeai as genai
+# ========== CONFIG ==========
+MODEL_PATH = "models/parent_layer/parent_model_rf.joblib"
+PREPROC_PATH = "models/preprocessors/parent_preprocessor.joblib"
 
-    if os.getenv("GOOGLE_API_KEY"):
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        GEMINI_AVAILABLE = True
-except Exception:
-    GEMINI_AVAILABLE = False
+# Optional: Google Drive direct download links
+MODEL_URL = os.getenv("MODEL_URL")      # set in Render env vars
+PREPROC_URL = os.getenv("PREPROC_URL")  # set in Render env vars
 
+USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
 
-# ==============================
-# PATHS
-# ==============================
-BASE_DIR = Path(__file__).parent
-
-DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
-
-MODEL_DIR = BASE_DIR / "models" / "parent_layer"
-PREPROCESSOR_DIR = BASE_DIR / "models" / "preprocessors"
-
-MODEL_PATH = MODEL_DIR / "parent_model_rf.joblib"
-PREPROCESSOR_PATH = PREPROCESSOR_DIR / "parent_preprocessor_coltransformer.joblib"
-
-# Ensure directories exist (Render-safe)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-PREPROCESSOR_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ==============================
-# ENSURE MODEL EXISTS (RENDER-SAFE)
-# ==============================
-def ensure_model_exists():
-    if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
-        print("Model or preprocessor missing. Training on startup...")
-
-        subprocess.run(
-            [
-                "python",
-                "train_and_predict_rf.py",
-                "--train",
-                "--data", str(DATA_PATH),
-                "--out", str(MODEL_PATH),
-                "--preproc", str(PREPROCESSOR_PATH)
-            ],
-            check=True
-        )
-
-        if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
-            raise RuntimeError(
-                "Training script finished but model/preprocessor files were not created."
-            )
-
-        print("Training completed and artifacts found.")
-
-
-ensure_model_exists()
-
-# ==============================
-# LOAD ARTIFACTS
-# ==============================
-model = joblib.load(MODEL_PATH)
-preprocessor = joblib.load(PREPROCESSOR_PATH)
-
-
-# ==============================
-# LOAD CAREERS
-# ==============================
-careers_df = (
-    pd.read_csv(DATA_PATH)[
-        [
-            "career_id",
-            "c_avg_salary",
-            "c_job_security",
-            "c_prestige",
-            "c_tuition",
-            "c_location"
-        ]
-    ]
-    .drop_duplicates("career_id")
-)
-
-
-# ==============================
-# FASTAPI APP
-# ==============================
-app = FastAPI(
-    title="Parent Layer Career Recommendation API",
-    version="1.0"
-)
-
-
-# ==============================
-# INPUT SCHEMA
-# ==============================
-class ParentInput(BaseModel):
-    budget_max_tuition: float = Field(..., gt=0)
-
-    importance_finances: int = Field(..., ge=1, le=5)
-    importance_job_security: int = Field(..., ge=1, le=5)
-    importance_prestige: int = Field(..., ge=1, le=5)
-    parent_risk_tolerance: int = Field(..., ge=1, le=5)
-    influence_from_people: int = Field(..., ge=1, le=5)
-
-    location_preference: str = Field(..., pattern="^(local|national|international)$")
-    migration_allowed: bool
-
-    unacceptable_careers: List[str] = []
-
-
-# ==============================
-# HELPERS
-# ==============================
-def normalize_likert(x: int) -> float:
-    return (x - 1) / 4.0
-
-
-def location_match(parent_pref: str, career_loc: str) -> int:
-    order = {"local": 0, "national": 1, "international": 2}
-    return int(order[career_loc] <= order[parent_pref])
-
-
-def explain_with_gemini(career_id: str, score: float) -> str:
-    # HARD FAIL-SAFE: explanation must NEVER crash API
-    if not GEMINI_AVAILABLE:
-        return (
-            "This career aligns well with parental priorities such as financial stability, "
-            "job security, and long-term growth prospects."
-        )
-
-    prompt = f"""
-Explain to a parent why the career '{career_id}' received a high recommendation score of {round(score, 2)}.
-Focus on job security, income stability, prestige, and long-term prospects.
-Use simple, non-technical language.
-"""
+# ========== GEMINI (SAFE) ==========
+def explain_with_gemini(career_id: str, score: float):
+    if not USE_GEMINI:
+        return "Explanation unavailable (Gemini disabled)."
 
     try:
-        llm = genai.GenerativeModel("gemini-2.5-pro")
-        response = llm.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return (
-            "This career matches parental expectations based on stability, affordability, "
-            "and long-term prospects."
+        from google import genai
+
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+        prompt = (
+            f"Explain why career '{career_id}' is suitable "
+            f"based on a parent score of {score:.2f}."
         )
 
+        response = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=prompt,
+        )
 
-# ==============================
-# ENDPOINT
-# ==============================
-@app.post("/rescore-parent")
-def rescore_parent(input: ParentInput):
+        return response.text.strip()
 
-    parent_features = {
-        "p_financial_weight": normalize_likert(input.importance_finances),
-        "p_job_security_weight": normalize_likert(input.importance_job_security),
-        "p_prestige_weight": normalize_likert(input.importance_prestige),
-        "p_parent_risk_tolerance": normalize_likert(input.parent_risk_tolerance),
-        "p_weight_on_parent_layer": normalize_likert(input.influence_from_people),
-        "p_budget_max_tuition": input.budget_max_tuition,
-    }
+    except Exception as e:
+        return f"Explanation unavailable (Gemini error)."
 
-    rows = []
-    career_ids = []
+# ========== HELPERS ==========
+def download_if_missing(path: str, url: str):
+    if os.path.exists(path):
+        return
 
-    for _, c in careers_df.iterrows():
-        rows.append({
-            **parent_features,
+    if not url:
+        raise RuntimeError(f"Missing file {path} and no download URL provided.")
 
-            "c_avg_salary": c.c_avg_salary,
-            "c_job_security": c.c_job_security,
-            "c_prestige": c.c_prestige,
-            "c_tuition": c.c_tuition,
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-            "f_fin_ratio": c.c_avg_salary / max(1, input.budget_max_tuition * 3),
-            "f_tuition_affordable": int(c.c_tuition <= input.budget_max_tuition),
-            "f_location_match": location_match(input.location_preference, c.c_location),
-            "f_migration_ok": int(input.migration_allowed or c.c_location != "international"),
-            "f_is_unacceptable": int(c.career_id in input.unacceptable_careers),
-            "f_risk_penalty": 1.0
-        })
-        career_ids.append(c.career_id)
+    print(f"Downloading {path}...")
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
 
-    df = pd.DataFrame(rows)
-    X = preprocessor.transform(df)
-    scores = model.predict(X)
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-    results = [
-        {
-            "career_id": career_ids[i],
-            "parent_score": round(float(scores[i]), 3)
+def load_assets():
+    download_if_missing(MODEL_PATH, MODEL_URL)
+    download_if_missing(PREPROC_PATH, PREPROC_URL)
+
+    model = joblib.load(MODEL_PATH)
+    preprocessor = joblib.load(PREPROC_PATH)
+    return model, preprocessor
+
+# ========== APP ==========
+app = FastAPI()
+
+model, preprocessor = load_assets()
+
+@app.post("/score")
+def score_parent(payload: dict):
+    try:
+        X = preprocessor.transform([payload])
+        score = float(model.predict_proba(X)[0][1])
+
+        explanation = explain_with_gemini(
+            payload.get("career_id", "unknown"),
+            score
+        )
+
+        return {
+            "parent_score": round(score, 4),
+            "explanation": explanation
         }
-        for i in range(len(scores))
-    ]
 
-    results.sort(key=lambda x: x["parent_score"], reverse=True)
-
-    top_5 = results[:5]
-    best = top_5[0]
-
-    explanation = explain_with_gemini(best["career_id"], best["parent_score"])
-
-    return {
-        "top_5_parent_scores": top_5,
-        "final_recommendation": {
-            "career_id": best["career_id"],
-            "parent_score": best["parent_score"],
-            "parent_explanation": explanation
-        }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
