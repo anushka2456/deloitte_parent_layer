@@ -7,16 +7,25 @@ import joblib
 import os
 import subprocess
 
-# ---------- OPTIONAL GEMINI (FAIL-SAFE) ----------
+# ==============================
+# OPTIONAL GEMINI (FAIL-SAFE)
+# ==============================
+GEMINI_AVAILABLE = False
 try:
+    # google-generativeai is deprecated but still works;
+    # we make it OPTIONAL and NON-BLOCKING
     import google.generativeai as genai
-    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    GEMINI_AVAILABLE = True
+
+    if os.getenv("GOOGLE_API_KEY"):
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        GEMINI_AVAILABLE = True
 except Exception:
     GEMINI_AVAILABLE = False
 
 
-# ---------- PATHS ----------
+# ==============================
+# PATHS
+# ==============================
 BASE_DIR = Path(__file__).parent
 
 DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
@@ -27,19 +36,27 @@ PREPROCESSOR_DIR = BASE_DIR / "models" / "preprocessors"
 MODEL_PATH = MODEL_DIR / "parent_model_rf.joblib"
 PREPROCESSOR_PATH = PREPROCESSOR_DIR / "parent_preprocessor_coltransformer.joblib"
 
-
-# ---------- ENSURE DIRECTORIES EXIST ----------
+# Ensure directories exist (Render-safe)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 PREPROCESSOR_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------- ENSURE MODEL EXISTS (RENDER-SAFE) ----------
+# ==============================
+# ENSURE MODEL EXISTS (RENDER-SAFE)
+# ==============================
 def ensure_model_exists():
     if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
         print("Model or preprocessor missing. Training on startup...")
 
         subprocess.run(
-            ["python", "train_and_predict_rf.py"],
+            [
+                "python",
+                "train_and_predict_rf.py",
+                "--train",
+                "--data", str(DATA_PATH),
+                "--out", str(MODEL_PATH),
+                "--preproc", str(PREPROCESSOR_PATH)
+            ],
             check=True
         )
 
@@ -53,13 +70,16 @@ def ensure_model_exists():
 
 ensure_model_exists()
 
-
-# ---------- LOAD ARTIFACTS ----------
+# ==============================
+# LOAD ARTIFACTS
+# ==============================
 model = joblib.load(MODEL_PATH)
 preprocessor = joblib.load(PREPROCESSOR_PATH)
 
 
-# ---------- LOAD CAREERS ----------
+# ==============================
+# LOAD CAREERS
+# ==============================
 careers_df = (
     pd.read_csv(DATA_PATH)[
         [
@@ -75,14 +95,18 @@ careers_df = (
 )
 
 
-# ---------- FASTAPI ----------
+# ==============================
+# FASTAPI APP
+# ==============================
 app = FastAPI(
     title="Parent Layer Career Recommendation API",
     version="1.0"
 )
 
 
-# ---------- INPUT SCHEMA ----------
+# ==============================
+# INPUT SCHEMA
+# ==============================
 class ParentInput(BaseModel):
     budget_max_tuition: float = Field(..., gt=0)
 
@@ -98,7 +122,9 @@ class ParentInput(BaseModel):
     unacceptable_careers: List[str] = []
 
 
-# ---------- HELPERS ----------
+# ==============================
+# HELPERS
+# ==============================
 def normalize_likert(x: int) -> float:
     return (x - 1) / 4.0
 
@@ -109,6 +135,7 @@ def location_match(parent_pref: str, career_loc: str) -> int:
 
 
 def explain_with_gemini(career_id: str, score: float) -> str:
+    # HARD FAIL-SAFE: explanation must NEVER crash API
     if not GEMINI_AVAILABLE:
         return (
             "This career aligns well with parental priorities such as financial stability, "
@@ -133,7 +160,9 @@ Use simple, non-technical language.
         )
 
 
-# ---------- ENDPOINT ----------
+# ==============================
+# ENDPOINT
+# ==============================
 @app.post("/rescore-parent")
 def rescore_parent(input: ParentInput):
 
