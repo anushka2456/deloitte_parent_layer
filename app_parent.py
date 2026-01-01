@@ -2,7 +2,6 @@ import os
 import json
 import joblib
 import requests
-<<<<<<< HEAD
 from fastapi import FastAPI, HTTPException
 
 # ========== CONFIG ==========
@@ -12,7 +11,6 @@ PREPROC_PATH = "models/preprocessors/parent_preprocessor.joblib"
 # Optional: Google Drive direct download links
 MODEL_URL = os.getenv("MODEL_URL")      # set in Render env vars
 PREPROC_URL = os.getenv("PREPROC_URL")  # set in Render env vars
-=======
 from typing import List
 
 import pandas as pd
@@ -47,11 +45,9 @@ model = None
 preprocessor = None
 careers_df = None
 llm = None
->>>>>>> d4fe21df85ffc9c34556abc94f4031c28b3f3712
 
 USE_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
 
-<<<<<<< HEAD
 # ========== GEMINI (SAFE) ==========
 def explain_with_gemini(career_id: str, score: float):
     if not USE_GEMINI:
@@ -126,7 +122,6 @@ def score_parent(payload: dict):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-=======
 # -------------------------
 # UTILITIES
 # -------------------------
@@ -248,4 +243,3 @@ def rescore_parent(req: ParentRequest):
             "parent_explanation": explanation
         }
     }
->>>>>>> d4fe21df85ffc9c34556abc94f4031c28b3f3712
