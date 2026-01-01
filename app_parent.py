@@ -1,225 +1,120 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-from typing import List
-from pathlib import Path
-import pandas as pd
-import joblib
 import os
-import subprocess
+import joblib
+import requests
+import pandas as pd
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
+from google import genai
 
-# ==============================
-# OPTIONAL GEMINI (FAIL-SAFE)
-# ==============================
-GEMINI_AVAILABLE = False
-try:
-    # google-generativeai is deprecated but still works;
-    # we make it OPTIONAL and NON-BLOCKING
-    import google.generativeai as genai
+# ---------------- CONFIG ----------------
 
-    if os.getenv("GOOGLE_API_KEY"):
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        GEMINI_AVAILABLE = True
-except Exception:
-    GEMINI_AVAILABLE = False
+MODEL_URL = os.getenv("PARENT_MODEL_URL")  # hosted joblib
+PREPROC_URL = os.getenv("PARENT_PREPROC_URL")
 
+MODEL_PATH = "parent_model.joblib"
+PREPROC_PATH = "parent_preprocessor.joblib"
 
-# ==============================
-# PATHS
-# ==============================
-BASE_DIR = Path(__file__).parent
+CAREERS_CSV = "careers.csv"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
+# ---------------- APP ----------------
 
-MODEL_DIR = BASE_DIR / "models" / "parent_layer"
-PREPROCESSOR_DIR = BASE_DIR / "models" / "preprocessors"
+app = FastAPI(title="Parent Layer Scoring API")
 
-MODEL_PATH = MODEL_DIR / "parent_model_rf.joblib"
-PREPROCESSOR_PATH = PREPROCESSOR_DIR / "parent_preprocessor_coltransformer.joblib"
+# ---------------- LOADERS ----------------
 
-# Ensure directories exist (Render-safe)
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-PREPROCESSOR_DIR.mkdir(parents=True, exist_ok=True)
+def download_if_missing(url: str, path: str):
+    if not os.path.exists(path):
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
 
+def safe_load_models():
+    if not MODEL_URL or not PREPROC_URL:
+        raise RuntimeError("Model URLs not set in environment")
 
-# ==============================
-# ENSURE MODEL EXISTS (RENDER-SAFE)
-# ==============================
-def ensure_model_exists():
-    if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
-        print("Model or preprocessor missing. Training on startup...")
+    download_if_missing(MODEL_URL, MODEL_PATH)
+    download_if_missing(PREPROC_URL, PREPROC_PATH)
 
-        subprocess.run(
-            [
-                "python",
-                "train_and_predict_rf.py",
-                "--train",
-                "--data", str(DATA_PATH),
-                "--out", str(MODEL_PATH),
-                "--preproc", str(PREPROCESSOR_PATH)
-            ],
-            check=True
-        )
+    model = joblib.load(MODEL_PATH)
+    preproc = joblib.load(PREPROC_PATH)
+    return model, preproc
 
-        if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
-            raise RuntimeError(
-                "Training script finished but model/preprocessor files were not created."
-            )
+model, preprocessor = safe_load_models()
+careers_df = pd.read_csv(CAREERS_CSV)
 
-        print("Training completed and artifacts found.")
-
-
-ensure_model_exists()
-
-# ==============================
-# LOAD ARTIFACTS
-# ==============================
-model = joblib.load(MODEL_PATH)
-preprocessor = joblib.load(PREPROCESSOR_PATH)
-
-
-# ==============================
-# LOAD CAREERS
-# ==============================
-careers_df = (
-    pd.read_csv(DATA_PATH)[
-        [
-            "career_id",
-            "c_avg_salary",
-            "c_job_security",
-            "c_prestige",
-            "c_tuition",
-            "c_location"
-        ]
-    ]
-    .drop_duplicates("career_id")
-)
-
-
-# ==============================
-# FASTAPI APP
-# ==============================
-app = FastAPI(
-    title="Parent Layer Career Recommendation API",
-    version="1.0"
-)
-
-
-# ==============================
-# INPUT SCHEMA
-# ==============================
-class ParentInput(BaseModel):
-    budget_max_tuition: float = Field(..., gt=0)
-
-    importance_finances: int = Field(..., ge=1, le=5)
-    importance_job_security: int = Field(..., ge=1, le=5)
-    importance_prestige: int = Field(..., ge=1, le=5)
-    parent_risk_tolerance: int = Field(..., ge=1, le=5)
-    influence_from_people: int = Field(..., ge=1, le=5)
-
-    location_preference: str = Field(..., pattern="^(local|national|international)$")
-    migration_allowed: bool
-
-    unacceptable_careers: List[str] = []
-
-
-# ==============================
-# HELPERS
-# ==============================
-def normalize_likert(x: int) -> float:
-    return (x - 1) / 4.0
-
-
-def location_match(parent_pref: str, career_loc: str) -> int:
-    order = {"local": 0, "national": 1, "international": 2}
-    return int(order[career_loc] <= order[parent_pref])
-
+# ---------------- GEMINI ----------------
 
 def explain_with_gemini(career_id: str, score: float) -> str:
-    # HARD FAIL-SAFE: explanation must NEVER crash API
-    if not GEMINI_AVAILABLE:
-        return (
-            "This career aligns well with parental priorities such as financial stability, "
-            "job security, and long-term growth prospects."
-        )
-
-    prompt = f"""
-Explain to a parent why the career '{career_id}' received a high recommendation score of {round(score, 2)}.
-Focus on job security, income stability, prestige, and long-term prospects.
-Use simple, non-technical language.
-"""
+    if not GEMINI_API_KEY:
+        return "Explanation unavailable."
 
     try:
-        llm = genai.GenerativeModel("gemini-2.5-pro")
-        response = llm.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return (
-            "This career matches parental expectations based on stability, affordability, "
-            "and long-term prospects."
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = (
+            f"Explain briefly why parents would prefer the career '{career_id}'. "
+            f"The compatibility score is {score:.2f}. Focus on finances, stability, prestige."
         )
+        response = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception:
+        return "Explanation unavailable."
 
+# ---------------- SCHEMA ----------------
 
-# ==============================
-# ENDPOINT
-# ==============================
+class ParentInput(BaseModel):
+    budget_max_tuition: float
+    importance_finances: int
+    importance_job_security: int
+    importance_prestige: int
+    parent_risk_tolerance: int
+    influence_from_people: int
+    migration_allowed: bool
+    location_preference: str
+    unacceptable_careers: List[str]
+
+# ---------------- ENDPOINT ----------------
+
 @app.post("/rescore-parent")
-def rescore_parent(input: ParentInput):
+def rescore_parent(data: ParentInput):
+    df = careers_df.copy()
 
-    parent_features = {
-        "p_financial_weight": normalize_likert(input.importance_finances),
-        "p_job_security_weight": normalize_likert(input.importance_job_security),
-        "p_prestige_weight": normalize_likert(input.importance_prestige),
-        "p_parent_risk_tolerance": normalize_likert(input.parent_risk_tolerance),
-        "p_weight_on_parent_layer": normalize_likert(input.influence_from_people),
-        "p_budget_max_tuition": input.budget_max_tuition,
-    }
+    df["f_is_unacceptable"] = df["career_id"].isin(data.unacceptable_careers).astype(int)
+    df["f_tuition_affordable"] = (df["tuition"] <= data.budget_max_tuition).astype(int)
 
-    rows = []
-    career_ids = []
+    for col, val in {
+        "importance_finances": data.importance_finances,
+        "importance_job_security": data.importance_job_security,
+        "importance_prestige": data.importance_prestige,
+        "parent_risk_tolerance": data.parent_risk_tolerance,
+        "influence_from_people": data.influence_from_people,
+    }.items():
+        df[col] = val / 5.0
 
-    for _, c in careers_df.iterrows():
-        rows.append({
-            **parent_features,
-
-            "c_avg_salary": c.c_avg_salary,
-            "c_job_security": c.c_job_security,
-            "c_prestige": c.c_prestige,
-            "c_tuition": c.c_tuition,
-
-            "f_fin_ratio": c.c_avg_salary / max(1, input.budget_max_tuition * 3),
-            "f_tuition_affordable": int(c.c_tuition <= input.budget_max_tuition),
-            "f_location_match": location_match(input.location_preference, c.c_location),
-            "f_migration_ok": int(input.migration_allowed or c.c_location != "international"),
-            "f_is_unacceptable": int(c.career_id in input.unacceptable_careers),
-            "f_risk_penalty": 1.0
-        })
-        career_ids.append(c.career_id)
-
-    df = pd.DataFrame(rows)
     X = preprocessor.transform(df)
     scores = model.predict(X)
+    df["parent_score"] = scores
 
-    results = [
-        {
-            "career_id": career_ids[i],
-            "parent_score": round(float(scores[i]), 3)
-        }
-        for i in range(len(scores))
-    ]
+    top5 = (
+        df.sort_values("parent_score", ascending=False)
+        .head(5)[["career_id", "parent_score"]]
+        .to_dict(orient="records")
+    )
 
-    results.sort(key=lambda x: x["parent_score"], reverse=True)
-
-    top_5 = results[:5]
-    best = top_5[0]
-
+    best = top5[0]
     explanation = explain_with_gemini(best["career_id"], best["parent_score"])
 
     return {
-        "top_5_parent_scores": top_5,
+        "top_5_parent_scores": top5,
         "final_recommendation": {
             "career_id": best["career_id"],
-            "parent_score": best["parent_score"],
-            "parent_explanation": explanation
-        }
+            "parent_score": round(float(best["parent_score"]), 3),
+            "parent_explanation": explanation,
+        },
     }
