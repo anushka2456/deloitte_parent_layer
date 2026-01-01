@@ -6,4 +6,7 @@ scikit-learn
 joblib
 google-genai
 requests
+<<<<<<< HEAD
 
+=======
+>>>>>>> a466dc4 (Load model from Drive, switch to google.genai)
