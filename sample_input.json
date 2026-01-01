@@ -1,0 +1,18 @@
+{
+  "f_fin_ratio": 1.2,
+  "f_risk_penalty": 1.0,
+  "p_financial_weight": 0.75,
+  "p_job_security_weight": 1.0,
+  "p_prestige_weight": 0.5,
+  "p_parent_risk_tolerance": 0.25,
+  "p_weight_on_parent_layer": 0.2,
+  "p_budget_max_tuition": 150000,
+  "c_avg_salary": 70000,
+  "c_job_security": 0.8,
+  "c_prestige": 0.7,
+  "c_tuition": 20000,
+  "f_location_match": 1,
+  "f_tuition_affordable": 1,
+  "f_migration_ok": 1,
+  "f_is_unacceptable": 0
+}
