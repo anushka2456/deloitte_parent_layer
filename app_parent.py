@@ -5,8 +5,9 @@ from pathlib import Path
 import pandas as pd
 import joblib
 import os
+import subprocess
 
-# ---------- OPTIONAL Gemini (safe import) ----------
+# ---------- OPTIONAL GEMINI (FAIL-SAFE) ----------
 try:
     import google.generativeai as genai
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -14,18 +15,41 @@ try:
 except Exception:
     GEMINI_AVAILABLE = False
 
-# ---------- Paths ----------
+
+# ---------- PATHS ----------
 BASE_DIR = Path(__file__).parent
 
 DATA_PATH = BASE_DIR / "parent_only_synthetic_dataset.csv"
 MODEL_PATH = BASE_DIR / "models" / "parent_layer" / "parent_model_rf.joblib"
 PREPROCESSOR_PATH = BASE_DIR / "models" / "preprocessors" / "parent_preprocessor_coltransformer.joblib"
 
-# ---------- Load artifacts ----------
+
+# ---------- ENSURE MODEL EXISTS (RENDER-SAFE) ----------
+def ensure_model_exists():
+    if not MODEL_PATH.exists() or not PREPROCESSOR_PATH.exists():
+        print("Model or preprocessor missing. Training on startup...")
+
+        subprocess.run(
+            ["python", "models/preprocessors/build_preprocessor.py"],
+            check=True
+        )
+
+        subprocess.run(
+            ["python", "train_parent_layer.py"],
+            check=True
+        )
+
+        print("Training completed.")
+
+
+ensure_model_exists()
+
+# ---------- LOAD ARTIFACTS ----------
 model = joblib.load(MODEL_PATH)
 preprocessor = joblib.load(PREPROCESSOR_PATH)
 
-# ---------- Load careers ----------
+
+# ---------- LOAD CAREERS ----------
 careers_df = (
     pd.read_csv(DATA_PATH)[
         [
@@ -40,13 +64,15 @@ careers_df = (
     .drop_duplicates("career_id")
 )
 
-# ---------- FastAPI ----------
+
+# ---------- FASTAPI ----------
 app = FastAPI(
     title="Parent Layer Career Recommendation API",
     version="1.0"
 )
 
-# ---------- Input Schema ----------
+
+# ---------- INPUT SCHEMA ----------
 class ParentInput(BaseModel):
     budget_max_tuition: float = Field(..., gt=0)
 
@@ -61,7 +87,8 @@ class ParentInput(BaseModel):
 
     unacceptable_careers: List[str] = []
 
-# ---------- Helpers ----------
+
+# ---------- HELPERS ----------
 def normalize_likert(x: int) -> float:
     return (x - 1) / 4.0
 
@@ -72,6 +99,7 @@ def location_match(parent_pref: str, career_loc: str) -> int:
 
 
 def explain_with_gemini(career_id: str, score: float) -> str:
+    # HARD FAIL-SAFE: explanation must NEVER crash API
     if not GEMINI_AVAILABLE:
         return (
             "This career aligns well with parental priorities such as financial stability, "
@@ -80,14 +108,8 @@ def explain_with_gemini(career_id: str, score: float) -> str:
 
     prompt = f"""
 Explain to a parent why the career '{career_id}' received a high recommendation score of {round(score, 2)}.
-
-Focus on:
-- job security
-- income stability
-- prestige
-- long-term prospects
-
-Use simple language. Avoid technical terms.
+Focus on job security, income stability, prestige, and long-term prospects.
+Use simple, non-technical language.
 """
 
     try:
@@ -95,7 +117,6 @@ Use simple language. Avoid technical terms.
         response = llm.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        # CRITICAL: never crash the API because of Gemini
         print("Gemini error:", e)
         return (
             "This career matches parental expectations based on stability, affordability, "
@@ -103,7 +124,7 @@ Use simple language. Avoid technical terms.
         )
 
 
-# ---------- Endpoint ----------
+# ---------- ENDPOINT ----------
 @app.post("/rescore-parent")
 def rescore_parent(input: ParentInput):
 
