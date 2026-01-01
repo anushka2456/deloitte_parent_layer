@@ -1,120 +1,161 @@
 import os
+import json
 import joblib
 import requests
+from typing import List
+
 import pandas as pd
-import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+
+# ✅ NEW Gemini SDK (NOT deprecated)
 from google import genai
 
-# ---------------- CONFIG ----------------
+# -------------------------
+# CONFIG
+# -------------------------
 
-MODEL_URL = os.getenv("PARENT_MODEL_URL")  # hosted joblib
-PREPROC_URL = os.getenv("PARENT_PREPROC_URL")
+MODEL_DIR = "models/runtime"
+MODEL_PATH = os.path.join(MODEL_DIR, "parent_model.joblib")
+PREPROC_PATH = os.path.join(MODEL_DIR, "parent_preprocessor.joblib")
+CAREERS_CSV = "data/careers.csv"  # small metadata file, safe in git
 
-MODEL_PATH = "parent_model.joblib"
-PREPROC_PATH = "parent_preprocessor.joblib"
+# 🔴 REPLACE THESE WITH YOUR OWN DRIVE LINKS
+MODEL_URL = "https://drive.google.com/file/d/1ZnKTrw9LoJUnx4Bu4URxNEcanJ8PZdYF/view?usp=drive_link"
+PREPROC_URL = "https://drive.google.com/file/d/19LE1Q9fJl4dVjdlSkePu87hUmR_IWDar/view?usp=drive_link"
 
-CAREERS_CSV = "careers.csv"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-pro"
 
-# ---------------- APP ----------------
+# -------------------------
+# APP INIT
+# -------------------------
 
-app = FastAPI(title="Parent Layer Scoring API")
+app = FastAPI(title="Parent Layer API")
 
-# ---------------- LOADERS ----------------
+model = None
+preprocessor = None
+careers_df = None
+llm = None
 
-def download_if_missing(url: str, path: str):
-    if not os.path.exists(path):
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            f.write(r.content)
 
-def safe_load_models():
-    if not MODEL_URL or not PREPROC_URL:
-        raise RuntimeError("Model URLs not set in environment")
+# -------------------------
+# UTILITIES
+# -------------------------
 
-    download_if_missing(MODEL_URL, MODEL_PATH)
-    download_if_missing(PREPROC_URL, PREPROC_PATH)
+def download_file(url: str, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        return
+    r = requests.get(url, stream=True, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to download {url}")
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-    model = joblib.load(MODEL_PATH)
-    preproc = joblib.load(PREPROC_PATH)
-    return model, preproc
 
-model, preprocessor = safe_load_models()
-careers_df = pd.read_csv(CAREERS_CSV)
-
-# ---------------- GEMINI ----------------
-
-def explain_with_gemini(career_id: str, score: float) -> str:
-    if not GEMINI_API_KEY:
+def safe_gemini_explain(career_id: str, score: float) -> str:
+    if llm is None:
         return "Explanation unavailable."
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
-            f"Explain briefly why parents would prefer the career '{career_id}'. "
-            f"The compatibility score is {score:.2f}. Focus on finances, stability, prestige."
+            f"Explain in 1–2 sentences why parents might prefer the career "
+            f"'{career_id}' given a compatibility score of {score:.2f}."
         )
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
+        resp = llm.models.generate_content(
+            model=GEMINI_MODEL,
             contents=prompt
         )
-        return response.text.strip()
+        return resp.text.strip()
     except Exception:
-        return "Explanation unavailable."
+        return "This career aligns well with parental priorities such as stability, finances, and long-term prospects."
 
-# ---------------- SCHEMA ----------------
 
-class ParentInput(BaseModel):
+# -------------------------
+# STARTUP
+# -------------------------
+
+@app.on_event("startup")
+def startup():
+    global model, preprocessor, careers_df, llm
+
+    # 1. Download artifacts
+    download_file(MODEL_URL, MODEL_PATH)
+    download_file(PREPROC_URL, PREPROC_PATH)
+
+    # 2. Load artifacts
+    model = joblib.load(MODEL_PATH)
+    preprocessor = joblib.load(PREPROC_PATH)
+
+    # 3. Load careers metadata
+    careers_df = pd.read_csv(CAREERS_CSV)
+
+    # 4. Init Gemini (optional but preferred)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        llm = genai.Client(api_key=api_key)
+    else:
+        llm = None
+
+
+# -------------------------
+# SCHEMA
+# -------------------------
+
+class ParentRequest(BaseModel):
     budget_max_tuition: float
+
     importance_finances: int
     importance_job_security: int
     importance_prestige: int
     parent_risk_tolerance: int
     influence_from_people: int
+
     migration_allowed: bool
     location_preference: str
-    unacceptable_careers: List[str]
 
-# ---------------- ENDPOINT ----------------
+    unacceptable_careers: List[str] = []
+
+
+# -------------------------
+# ENDPOINT
+# -------------------------
 
 @app.post("/rescore-parent")
-def rescore_parent(data: ParentInput):
+def rescore_parent(req: ParentRequest):
+    if model is None or preprocessor is None:
+        raise HTTPException(500, "Model not loaded")
+
     df = careers_df.copy()
 
-    df["f_is_unacceptable"] = df["career_id"].isin(data.unacceptable_careers).astype(int)
-    df["f_tuition_affordable"] = (df["tuition"] <= data.budget_max_tuition).astype(int)
-
-    for col, val in {
-        "importance_finances": data.importance_finances,
-        "importance_job_security": data.importance_job_security,
-        "importance_prestige": data.importance_prestige,
-        "parent_risk_tolerance": data.parent_risk_tolerance,
-        "influence_from_people": data.influence_from_people,
-    }.items():
-        df[col] = val / 5.0
+    # Parent features (broadcast)
+    df["budget_max_tuition"] = req.budget_max_tuition
+    df["importance_finances"] = req.importance_finances
+    df["importance_job_security"] = req.importance_job_security
+    df["importance_prestige"] = req.importance_prestige
+    df["parent_risk_tolerance"] = req.parent_risk_tolerance
+    df["influence_from_people"] = req.influence_from_people
+    df["migration_allowed"] = int(req.migration_allowed)
+    df["location_preference"] = req.location_preference
+    df["is_unacceptable"] = df["career_id"].isin(req.unacceptable_careers).astype(int)
 
     X = preprocessor.transform(df)
     scores = model.predict(X)
+
     df["parent_score"] = scores
+    df = df.sort_values("parent_score", ascending=False)
 
-    top5 = (
-        df.sort_values("parent_score", ascending=False)
-        .head(5)[["career_id", "parent_score"]]
-        .to_dict(orient="records")
-    )
-
+    top5 = df.head(5)[["career_id", "parent_score"]].to_dict(orient="records")
     best = top5[0]
-    explanation = explain_with_gemini(best["career_id"], best["parent_score"])
+
+    explanation = safe_gemini_explain(best["career_id"], best["parent_score"])
 
     return {
         "top_5_parent_scores": top5,
         "final_recommendation": {
             "career_id": best["career_id"],
-            "parent_score": round(float(best["parent_score"]), 3),
-            "parent_explanation": explanation,
-        },
+            "parent_score": round(best["parent_score"], 3),
+            "parent_explanation": explanation
+        }
     }
